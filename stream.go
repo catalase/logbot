@@ -6,12 +6,12 @@ import (
 	"strings"
 )
 
-type byteWriter []byte
+// type byteWriter []byte
 
-func (w *byteWriter) Write(b []byte) (int, error) {
-	*w = append(*w, b...)
-	return len(b), nil
-}
+// func (w *byteWriter) Write(b []byte) (int, error) {
+// 	*w = append(*w, b...)
+// 	return len(b), nil
+// }
 
 type Msg struct {
 	Prefix
@@ -31,12 +31,12 @@ type Stream struct {
 
 // Msg send command to the server.
 func (stream *Stream) Msg(command string, args ...string) error {
-	var message byteWriter = byteWriter(command)
+	message := []byte(command)
 
 	if len(args) > 0 {
 		last := args[len(args)-1]
 		if len(args) > 1 {
-			for _, arg := range args[:len(args) - 1] {
+			for _, arg := range args[:len(args)-1] {
 				message = append(message, ' ')
 				message = append(message, []byte(arg)...)
 			}

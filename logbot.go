@@ -3,28 +3,26 @@ package main
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
+	// "io/ioutil"
 	"log"
 	"math"
 	"os"
 	"reflect"
-	"runtime"
+	// "runtime"
 	"strconv"
 	"strings"
 	"time"
+	// "sync"
 )
+
+const logsdir = "logs"
 
 var loggerMap = make(LoggerMap)
 
 type LoggerMap map[string]*os.File
 
 func (loggerMap LoggerMap) Get(channel string) io.Writer {
-	w, ok := loggerMap[channel]
-	if !ok {
-		return ioutil.Discard
-	}
-
-	return w
+	return loggerMap[channel]
 }
 
 func (loggerMap LoggerMap) Set(channel, path string) error {
@@ -61,19 +59,22 @@ type Bot struct {
 
 	// a element at index 0 = channel (or target)
 	// a element of index 1 = text to be sent to the channel (or target)
-	voice      chan [2]string
-	closevoice chan bool
+	voice       chan Voice
+	closestream chan bool
+}
+
+type Voice struct {
+	channel string
+	message string
 }
 
 func (bot *Bot) Voice(channel, message string) {
-	voice := [2]string{
+	select {
+	case bot.voice <- Voice{
 		channel,
 		message,
-	}
-
-	select {
-	case bot.voice <- voice:
-	case <-bot.closevoice:
+	}:
+	case <-bot.closestream:
 	}
 }
 
@@ -83,52 +84,123 @@ func (bot *Bot) Msg(command string, args ...string) error {
 }
 
 func (bot *Bot) Run() error {
-	bot.voice = make(chan [2]string)
-	bot.closevoice = make(chan bool)
+	bot.voice = make(chan Voice)
+	bot.closestream = make(chan bool)
 
 	go func() {
-		var voices [][2]string
-		var timer <-chan time.Time
+		var attend = make(map[string]chan Voice)
 
 		for {
 			select {
 			case voice := <-bot.voice:
-				if len(voices) == 0 {
-					if timer == nil {
-						c := make(chan time.Time, 1)
-						c <- time.Now()
-						timer = c
-					} else {
-						timer = time.After(time.Second)
-					}
+				line, ok := attend[voice.channel]
+				if !ok {
+					line = make(chan Voice)
+					attend[voice.channel] = line
+					go func(channel string, line chan Voice) {
+						var voices []Voice
+						var tick <-chan time.Time
+
+						ticker := time.NewTicker(time.Second)
+
+						defer func() {
+							ticker.Stop()
+							delete(attend, channel)
+						}()
+
+						for {
+							select {
+							case voice := <-line:
+								if len(voices) == 0 {
+									tick = ticker.C
+								}
+
+								voices = append(voices, voice)
+
+							case <-tick:
+								voice := voices[0]
+								voices = voices[1:]
+								if len(voices) == 0 {
+									tick = nil
+								}
+
+								bot.Msg(
+									"PRIVMSG",
+									voice.channel,
+									voice.message,
+								)
+
+							case <-bot.closestream:
+								return
+							}
+						}
+					}(voice.channel, line)
 				}
-				voices = append(voices, voice)
-			case <-timer:
-				if len(voices) > 0 {
-					voice := voices[0]
-					voices = voices[1:]
-					bot.Msg("PRIVMSG", voice[0], voice[1])
-					if len(voices) > 0 {
-						timer = time.After(time.Second)
-					}
-				}
-			case <-bot.closevoice:
+
+				line <- voice
+			}
+		}
+	}()
+
+	// go func() {
+	// 	var voices [][2]string
+	// 	var timer <-chan time.Time
+
+	// 	for {
+	// 		select {
+	// 		case voice := <-bot.voice:
+	// 			if len(voices) == 0 {
+	// 				if timer == nil {
+	// 					c := make(chan time.Time, 1)
+	// 					c <- time.Now()
+	// 					timer = c
+	// 				} else {
+	// 					timer = time.After(time.Second)
+	// 				}
+	// 			}
+	// 			voices = append(voices, voice)
+	// 		case <-timer:
+	// 			if len(voices) > 0 {
+	// 				voice := voices[0]
+	// 				voices = voices[1:]
+	// 				bot.Msg("PRIVMSG", voice[0], voice[1])
+	// 				if len(voices) > 0 {
+	// 					timer = time.After(time.Second)
+	// 				}
+	// 			}
+	// 		case <-bot.closestream:
+	// 			return
+	// 		}
+	// 	}
+	// }()
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+
+		for {
+			select {
+			case <-ticker.C:
+				bot.Msg("PING")
+			case <-bot.closestream:
+				ticker.Stop()
 				return
 			}
 		}
 	}()
 
-	bot.Auth()
+	bot.Msg("NICK", bot.nick)
+	bot.Msg("USER", bot.user, "0", "*", bot.realname)
 
 	for {
 		msg, err := bot.ReadMsg()
 		if err != nil {
-			close(bot.closevoice)
+			close(bot.closestream)
 			bot.Close()
 			return err
 		}
 
-		bot.OnRead(msg)
+		fmt.Println("->", msg)
+		fmt.Fprintln(loggerMap.Get("mid"), "->", msg.line)
 
 		callback := reflect.ValueOf(bot).MethodByName(
 			"On" + strings.ToUpper(msg.command))
@@ -141,11 +213,6 @@ func (bot *Bot) Run() error {
 	}
 }
 
-func (bot *Bot) Auth() {
-	bot.Msg("NICK", bot.nick)
-	bot.Msg("USER", bot.user, "0", "*", bot.realname)
-}
-
 func (bot *Bot) OnPING(msg Msg) {
 	bot.Msg("PONG", msg.args...)
 }
@@ -153,12 +220,7 @@ func (bot *Bot) OnPING(msg Msg) {
 func (bot *Bot) OnMsg(command string, args ...string) {
 	line := BuildMsg(command, args)
 	fmt.Println("<-", line)
-	fmt.Fprintln(loggerMap.Get("!"), "<-", line)
-}
-
-func (bot *Bot) OnRead(msg Msg) {
-	fmt.Println("->", msg)
-	fmt.Fprintln(loggerMap.Get("!"), "->", msg.line)
+	fmt.Fprintln(loggerMap.Get("mid"), "<-", line)
 }
 
 func (bot *Bot) On001(msg Msg) {
@@ -179,12 +241,16 @@ func (bot *Bot) OnJOIN(msg Msg) {
 
 func (bot *Bot) OnPRIVMSG(msg Msg) {
 	channel, text := msg.args[0], msg.args[1]
-	fmt.Fprintln(loggerMap.Get(channel), msg.line)
+	if logger := loggerMap.Get(channel); logger != nil {
+		fmt.Fprintln(logger, msg.line)
+	}
 
 	if msg.Nick() != bot.nick {
-		if strings.HasPrefix(text, ":") {
-			bot.OnColon(msg)
-			return
+		if strings.HasPrefix(channel, "#") {
+			if strings.HasPrefix(text, ":") {
+				bot.OnColon(msg)
+				return
+			}
 		}
 	}
 }
@@ -201,7 +267,7 @@ func (bot *Bot) OnColon(msg Msg) {
 	case "logbot":
 		bot.Voice(
 			channel,
-			"다음 명령어가 사용 가능합니다: :ln, :log, :ver, :전역",
+			"다음 명령어가 사용 가능합니다: :ln, :log, :ver, :전역, :쿠키런크리스탈수",
 		)
 
 	case "ln":
@@ -211,15 +277,19 @@ func (bot *Bot) OnColon(msg Msg) {
 		bot.OnLog(channel, args)
 
 	case "ver":
-		bot.Voice(channel, "running on "+runtime.GOOS)
+		bot.Voice(channel, "logbot 0.1")
+
+	case "쿠키런크리스탈수":
+		bot.Voice(channel, "를 전화해서 물어보세요.")
+		// bot.Voice(channel, "the number of crystals you have in 쿠키런 is a neighborhood of fifteen hundred.")
 
 	case "전역":
 		bot.OnEsc(channel, args)
 
-	case "##":
-		if channel == bot.nick {
-			bot.OnSig(channel, args, msg)
-		}
+		// case "*":
+		// 	if channel == bot.nick {
+		// 		bot.OnSig(channel, args, msg)
+		// 	}
 	}
 }
 
@@ -261,7 +331,7 @@ func (bot *Bot) OnLog(channel string, args []string) {
 }
 
 func (bot *Bot) OnEsc(channel string, args []string) {
-	bot.Voice(channel, "귀찮아서 안만듬 전역 날짜 계산은 내가 만든 사이트 가서 보셈")
+	bot.Voice(channel, "http://catalase.github.io/ 가서 확인하세요.")
 }
 
 func (bot *Bot) OnSig(channel string, args []string, msg Msg) {
@@ -270,66 +340,73 @@ func (bot *Bot) OnSig(channel string, args []string, msg Msg) {
 	}
 }
 
-func tidy() {
-	for _, logger := range loggerMap {
-		logger.Close()
+func Mkdir(path string, mode os.FileMode) error {
+	err := os.Mkdir(path, mode)
+	if os.IsExist(err) {
+		return nil
 	}
+
+	return err
 }
 
 func main() {
-	var err error
-
-	if err = os.Mkdir(
-		"logging",
-		os.ModePerm,
-	); err != nil && !os.IsExist(err) {
-		log.Print(err)
+	if err := Mkdir(logsdir, os.ModePerm); err != nil {
+		fmt.Println("cannot mkdir logs with permission 0777:", err)
 		return
 	}
 
-	if err := os.Chdir("logging"); err != nil {
-		log.Print(err)
+	if err := os.Chdir(logsdir); err != nil {
+		fmt.Println("cannot change root directory to", logsdir)
 		return
 	}
 
-	address := "kanade.irc.ozinger.org:8080"
-	bot := Bot{
-		nick:     "비스무트",
-		user:     "ununseptium",
-		realname: "하슘",
-		channels: []string{
-			"#catalase",
-			"#catalase-nut",
-			"#green-net",
-			"#green-pie",
-		},
+	defer func() {
+		for _, o := range loggerMap {
+			o.Close()
+		}
+	}()
+
+	var address = "kanade.irc.ozinger.org:8080"
+	var nick = "비스무트"
+	var user = "ununseptium"
+	var realname = "하슘"
+	var channels = []string{
+		"#catalase",
+		"#catalase-nut",
+		"#green-net",
+		"#green-pie",
 	}
 
 	for _, channel := range append(
-		bot.channels,
-		"!",
-		bot.nick,
+		channels,
+		"mid",
+		nick,
 	) {
-		if err = loggerMap.Set(
-			channel,
-			channel+".txt",
-		); err != nil {
-			log.Print(err)
-			tidy()
+		path := channel + ".txt"
+		if err := loggerMap.Set(channel, path); err != nil {
+			fmt.Println("cannot open logger for channel", channel,
+				"into which conversation or exchange in the channel are written:", err)
 			return
 		}
 	}
 
+	bot := Bot{
+		nick:     nick,
+		user:     user,
+		realname: realname,
+		channels: channels,
+	}
+
 	for {
+		var err error
 		bot.Stream, err = NewStream(address)
 		if err != nil {
-			log.Printf("cannot connect to irc server %s becuase %s", address, err)
-			time.Sleep(30 * time.Second)
+			log.Println(address, "cannot be connected to:", err)
+			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		log.Print(bot.Run())
-		log.Print("restart bot in 1 minute")
-		time.Sleep(time.Minute)
+		log.Println(bot.Run())
+		time.Sleep(time.Second)
 	}
 }
