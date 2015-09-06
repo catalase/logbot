@@ -26,7 +26,7 @@ func (loggerMap LoggerMap) Get(channel string) io.Writer {
 }
 
 func (loggerMap LoggerMap) Set(channel, path string) error {
-	w, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE, 0200)
+	w, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE, 0777)
 	if err == nil {
 		loggerMap[channel] = w
 	}
