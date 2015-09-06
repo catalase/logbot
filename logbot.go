@@ -366,6 +366,7 @@ func main() {
 		}
 	}()
 
+	var address = "kanade.irc.ozinger.org:8080"
 	var nick = "비스무트"
 	var user = "ununseptium"
 	var realname = "하슘"
