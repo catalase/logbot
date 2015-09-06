@@ -180,7 +180,7 @@ func (bot *Bot) Run() error {
 		for {
 			select {
 			case <-ticker.C:
-				bot.Msg("PING")
+				bot.Msg("PING", "kanade.irc.ozinger.org")
 			case <-bot.closestream:
 				ticker.Stop()
 				return
@@ -366,7 +366,6 @@ func main() {
 		}
 	}()
 
-	var address = "kanade.irc.ozinger.org:8080"
 	var nick = "비스무트"
 	var user = "ununseptium"
 	var realname = "하슘"
@@ -399,7 +398,7 @@ func main() {
 
 	for {
 		var err error
-		bot.Stream, err = NewStream(address)
+		bot.Stream, err = NewStream("kanade.irc.ozinger.org:8080")
 		if err != nil {
 			log.Println(address, "cannot be connected to:", err)
 			time.Sleep(5 * time.Second)
