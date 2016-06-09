@@ -6,22 +6,32 @@ import (
 	"strings"
 )
 
-// type byteWriter []byte
-
-// func (w *byteWriter) Write(b []byte) (int, error) {
-// 	*w = append(*w, b...)
-// 	return len(b), nil
-// }
-
+// Msg represents a message used in IRC.
 type Msg struct {
 	Prefix
-	command string
-	args    []string
-	line    string
+	Command string
+	Args    []string
+	Line    string
 }
 
-func (msg Msg) String() string {
-	return msg.line
+// func (message Msg) First() string {
+// 	if len(message.Args) > 0 {
+// 		return message.Args[0]
+// 	}
+// 	return ""
+// }
+
+// Tr returnes the trailer of the message (i.e. last element of Args)
+func (message Msg) Tr() string {
+	if i := len(message.Args); i > 0 {
+		return message.Args[i-1]
+	}
+	return ""
+}
+
+// String returnes raw string representation.
+func (message Msg) String() string {
+	return message.Line
 }
 
 type Stream struct {
@@ -29,8 +39,8 @@ type Stream struct {
 	c net.Conn
 }
 
-// Msg send command to the server.
-func (stream *Stream) Msg(command string, args ...string) error {
+// SendMsg sends message to the server.
+func (stream *Stream) SendMsg(command string, args ...string) error {
 	message := []byte(command)
 
 	if len(args) > 0 {
@@ -52,54 +62,52 @@ func (stream *Stream) Msg(command string, args ...string) error {
 	return err
 }
 
-func Chop(str, sep string) (string, string) {
-	i := strings.Index(str, sep)
-	if i < 0 {
-		return str, ""
-	}
-
-	return str[:i], str[i+len(sep):]
-}
-
 // ReadMsg reads a message as the date of server.
 func (stream *Stream) ReadMsg() (Msg, error) {
-	byteline, _, err := stream.r.ReadLine()
+	byteLine, _, err := stream.r.ReadLine()
 	if err != nil {
 		return Msg{}, err
 	}
 
 	var prefix Prefix
-	rawline := string(byteline)
-	line := rawline
+	line := string(byteLine)
 
-	if line[0] == ':' {
-		var prefixraw string
-		prefixraw, line = Chop(line, " ")
-		prefix = Prefix(prefixraw)
+	if len(line) > 0 {
+		if line[0] == ':' {
+			var left string
+			left, line = Tear(line, " ")
+			prefix = Prefix(left)
+		}
 	}
 
-	line, tr := Chop(line, " :")
-	command, line := Chop(line, " ")
+	line, tr := Tear(line, " :")
+	command, line := Tear(line, " ")
 
-	var arg string
-	var args []string
+	var (
+		arg  string
+		args []string
+	)
+
 	for len(line) > 0 {
-		arg, line = Chop(line, " ")
+		arg, line = Tear(line, " ")
 		args = append(args, arg)
 	}
-	args = append(args, tr)
+
+	if len(tr) > 0 {
+		args = append(args, tr)
+	}
 
 	msg := Msg{
 		prefix,
-		command,
+		strings.ToUpper(command),
 		args,
-		rawline,
+		string(byteLine),
 	}
 
 	return msg, nil
 }
 
-// Close closes the connection to server.
+// Close closes all resource associated with the stream.
 func (stream *Stream) Close() (err error) {
 	if stream.c != nil {
 		err = stream.c.Close()
@@ -111,7 +119,18 @@ func (stream *Stream) Close() (err error) {
 	return
 }
 
-func NewStream(address string) (*Stream, error) {
+// Tear rips apart str by sep into two parts.
+func Tear(str, sep string) (string, string) {
+	i := strings.Index(str, sep)
+	if i < 0 {
+		return str, ""
+	}
+
+	return str[:i], str[i+len(sep):]
+}
+
+// Dial creates new Stream.
+func Dial(address string) (*Stream, error) {
 	c, err := net.Dial("tcp", address)
 	if err != nil {
 		return nil, err
@@ -124,11 +143,4 @@ func NewStream(address string) (*Stream, error) {
 	}
 
 	return stream, nil
-}
-
-// https://en.wikipedia.org/wiki/Client-to-client_streamcol
-// CTCP <target> <command> <arguments>
-// a CTCP is the message that starts with \x01
-func IsCTCP(message string) bool {
-	return strings.HasPrefix(message, "\x01")
 }

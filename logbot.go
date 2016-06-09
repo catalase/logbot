@@ -1,21 +1,24 @@
 package main
 
 import (
+	// "errors"
 	"fmt"
 	"io"
-	// "io/ioutil"
-	"log"
-	"math"
+	// "log"
+	// "math"
 	"os"
 	"reflect"
-	// "runtime"
-	"strconv"
+	// "strconv"
 	"strings"
+	"sync/atomic"
 	"time"
-	// "sync"
+
+	"github.com/catalase/bulletin"
 )
 
-const logsdir = "logs"
+const (
+	logDir = "conversations"
+)
 
 var loggerMap = make(LoggerMap)
 
@@ -53,293 +56,302 @@ type Bot struct {
 	nick     string
 	user     string
 	realname string
-	channels []string
+	channels map[string]bool
+	address  string
 
 	*Stream
 
-	// a element at index 0 = channel (or target)
-	// a element of index 1 = text to be sent to the channel (or target)
-	voice       chan Voice
 	closestream chan bool
+	onnews      uint32
 }
 
-type Voice struct {
-	channel string
-	message string
+func (bot *Bot) PrivMsg(channel, message string) error {
+	return bot.SendMsg("PRIVMSG", channel, message)
 }
 
-func (bot *Bot) Voice(channel, message string) {
-	select {
-	case bot.voice <- Voice{
-		channel,
-		message,
-	}:
-	case <-bot.closestream:
-	}
-}
-
-func (bot *Bot) Msg(command string, args ...string) error {
-	bot.OnMsg(command, args...)
-	return bot.Stream.Msg(command, args...)
-}
-
-func (bot *Bot) Run() error {
-	bot.voice = make(chan Voice)
-	bot.closestream = make(chan bool)
-
-	go func() {
-		var attend = make(map[string]chan Voice)
-
-		for {
-			select {
-			case voice := <-bot.voice:
-				line, ok := attend[voice.channel]
-				if !ok {
-					line = make(chan Voice)
-					attend[voice.channel] = line
-					go func(channel string, line chan Voice) {
-						var voices []Voice
-						var tick <-chan time.Time
-
-						ticker := time.NewTicker(time.Second)
-
-						defer func() {
-							ticker.Stop()
-							delete(attend, channel)
-						}()
-
-						for {
-							select {
-							case voice := <-line:
-								if len(voices) == 0 {
-									tick = ticker.C
-								}
-
-								voices = append(voices, voice)
-
-							case <-tick:
-								voice := voices[0]
-								voices = voices[1:]
-								if len(voices) == 0 {
-									tick = nil
-								}
-
-								bot.Msg(
-									"PRIVMSG",
-									voice.channel,
-									voice.message,
-								)
-
-							case <-bot.closestream:
-								return
-							}
-						}
-					}(voice.channel, line)
-				}
-
-				line <- voice
-			}
-		}
-	}()
-
-	// go func() {
-	// 	var voices [][2]string
-	// 	var timer <-chan time.Time
-
-	// 	for {
-	// 		select {
-	// 		case voice := <-bot.voice:
-	// 			if len(voices) == 0 {
-	// 				if timer == nil {
-	// 					c := make(chan time.Time, 1)
-	// 					c <- time.Now()
-	// 					timer = c
-	// 				} else {
-	// 					timer = time.After(time.Second)
-	// 				}
-	// 			}
-	// 			voices = append(voices, voice)
-	// 		case <-timer:
-	// 			if len(voices) > 0 {
-	// 				voice := voices[0]
-	// 				voices = voices[1:]
-	// 				bot.Msg("PRIVMSG", voice[0], voice[1])
-	// 				if len(voices) > 0 {
-	// 					timer = time.After(time.Second)
-	// 				}
-	// 			}
-	// 		case <-bot.closestream:
-	// 			return
-	// 		}
-	// 	}
-	// }()
-
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-
-		for {
-			select {
-			case <-ticker.C:
-				bot.Msg("PING", "kanade.irc.ozinger.org")
-			case <-bot.closestream:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
-
-	bot.Msg("NICK", bot.nick)
-	bot.Msg("USER", bot.user, "0", "*", bot.realname)
-
-	for {
-		msg, err := bot.ReadMsg()
-		if err != nil {
-			close(bot.closestream)
-			bot.Close()
+func (bot *Bot) Broadcast(message string) error {
+	for channel := range bot.channels {
+		if err := bot.PrivMsg(channel, message); err != nil {
 			return err
 		}
+	}
 
-		fmt.Println("->", msg)
-		fmt.Fprintln(loggerMap.Get("mid"), "->", msg.line)
+	return nil
+}
 
-		callback := reflect.ValueOf(bot).MethodByName(
-			"On" + strings.ToUpper(msg.command))
+func (bot *Bot) Auth() {
+	bot.SendMsg("NICK", bot.nick)
+	bot.SendMsg("USER", bot.user, "0", "*", bot.realname)
+}
 
+func (bot *Bot) Run() {
+	bot.Auth()
+	bot.Do()
+}
+
+func (bot *Bot) Do() {
+	msgc := make(chan Msg)
+	errc := make(chan error, 1)
+
+	go func() {
+	Read:
+		msg, err := bot.ReadMsg()
+		if err == nil {
+			msgc <- msg
+			goto Read
+		}
+		close(msgc)
+		errc <- err
+	}()
+
+	callbackCache := make(map[string]reflect.Value)
+	refbot := reflect.ValueOf(bot)
+
+	for msg := range msgc {
+		fmt.Println(msg.Line)
+
+		callbackName := "On" + msg.Command
+		callback := callbackCache[callbackName]
+		if !callback.IsValid() {
+			callback = refbot.MethodByName(callbackName)
+		}
 		if callback.IsValid() {
 			callback.Call([]reflect.Value{
 				reflect.ValueOf(msg),
 			})
 		}
 	}
+
+	// err := <-errc
+	bot.Close()
+	close(bot.closestream)
 }
 
+// OnPING responds to PING message.
 func (bot *Bot) OnPING(msg Msg) {
-	bot.Msg("PONG", msg.args...)
+	bot.SendMsg("PONG", msg.Args...)
 }
 
-func (bot *Bot) OnMsg(command string, args ...string) {
-	line := BuildMsg(command, args)
-	fmt.Println("<-", line)
-	fmt.Fprintln(loggerMap.Get("mid"), "<-", line)
+func (bot *Bot) Keep() {
+	server, _ := Tear(bot.address, ":")
+	ticker := time.NewTicker(time.Second * 30)
+
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := bot.SendMsg("PING", server); err != nil {
+				return
+			}
+		case <-bot.closestream:
+			return
+		}
+	}
 }
 
+func hasNew(old map[string]bool, briefs []bulletin.Brief) bool {
+	for _, brief := range briefs {
+		if !old[brief.URL()] {
+			return true
+		}
+	}
+
+	return false
+}
+
+func makeOld(briefs []bulletin.Brief) map[string]bool {
+	old := make(map[string]bool)
+	for _, brief := range briefs {
+		old[brief.URL()] = true
+	}
+
+	return old
+}
+
+var KST = time.FixedZone("KST", 32400)
+
+func NowKST() time.Time {
+	return time.Now().In(KST)
+}
+
+func (bot *Bot) NewNews(old map[string]bool) map[string]bool {
+	briefs, err := bulletin.Briefs()
+	if err != nil {
+		return old
+	}
+
+	if !hasNew(old, briefs) {
+		return old
+	}
+
+	if atomic.LoadUint32(&bot.onnews) == 0 {
+		for _, brief := range briefs {
+			if url := brief.URL(); !old[url] {
+				now := NowKST()
+				delta := now.Sub(brief.Time())
+
+				min := uint(delta / time.Minute)
+				sec := uint(delta % time.Minute / time.Second)
+
+				if min == 0 {
+					bot.Broadcast(fmt.Sprintf("%ds ago - %s", sec, brief.Title()))
+				} else {
+					bot.Broadcast(fmt.Sprintf("%dm %ds ago - %s", min, sec, brief.Title()))
+				}
+
+				bot.Broadcast(brief.URL())
+			}
+		}
+	}
+
+	return makeOld(briefs)
+}
+
+func (bot *Bot) News() {
+	var old map[string]bool
+	ticker := time.NewTicker(5 * time.Second)
+
+	defer ticker.Stop()
+
+Retry:
+	if briefs, err := bulletin.Briefs(); err != nil {
+		select {
+		case <-ticker.C:
+			goto Retry
+		case <-bot.closestream:
+			return
+		}
+	} else {
+		old = makeOld(briefs)
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			old = bot.NewNews(old)
+		case <-bot.closestream:
+			return
+		}
+	}
+}
+
+// On001
 func (bot *Bot) On001(msg Msg) {
-	for _, channel := range bot.channels {
-		bot.Msg("JOIN", channel)
+	go bot.Keep()
+	go bot.News()
+
+	for channel := range bot.channels {
+		bot.SendMsg("JOIN", channel)
 	}
 }
 
+// OnJoin
 func (bot *Bot) OnJOIN(msg Msg) {
-	if msg.Nick() != bot.nick {
-		bot.Voice(
-			msg.args[0],
-			msg.Nick()+", 이 채널은 로그봇에 의하여 모든 대화가 기록됩니다."+
-				"로그봇이므로 로그 계산도 가능합니다. 자세한 것은 :logbot 을 외쳐주세요.",
-		)
+	nick, channel := msg.Nick(), msg.Args[0]
+
+	if nick == bot.nick {
+		bot.channels[channel] = true
+	} else {
+		bot.PrivMsg(channel, fmt.Sprintf(
+			"Welcome %s!", nick))
 	}
+}
+
+func (bot *Bot) OnPART(msg Msg) {
+	nick, channel := msg.Nick(), msg.Args[0]
+
+	if nick == bot.nick {
+		delete(bot.channels, channel)
+	} else {
+		bot.PrivMsg(channel, fmt.Sprintf(
+			"Goodbye %s", nick))
+	}
+}
+
+func (bot *Bot) OnINVITE(msg Msg) {
+	invitor, channel := msg.Args[0], msg.Args[1]
+	_ = invitor
+	bot.SendMsg("JOIN", channel)
+}
+
+type ColonAuth int
+
+const (
+	COLON_AUTH_ZERO ColonAuth = iota
+	COLON_AUTH_OWNER
+)
+
+type ColonArgs struct {
+	channel string
+	which   string
+	args    []string
+	grant   ColonAuth
+	Msg
 }
 
 func (bot *Bot) OnPRIVMSG(msg Msg) {
-	channel, text := msg.args[0], msg.args[1]
-	if logger := loggerMap.Get(channel); logger != nil {
-		fmt.Fprintln(logger, msg.line)
+	channel, message := msg.Args[0], msg.Args[1]
+
+	if bot.IsColonMsg(message) {
+		bot.ColonMsg(msg)
 	}
 
-	if msg.Nick() != bot.nick {
-		if strings.HasPrefix(channel, "#") {
-			if strings.HasPrefix(text, ":") {
-				bot.OnColon(msg)
-				return
+	_ = channel
+}
+
+func (bot *Bot) ColonMsg(msg Msg) {
+	channel, message := msg.Args[0], msg.Args[1]
+
+	// Direct message
+	if !strings.HasPrefix(channel, "#") {
+		bot.PrivMsg(channel, "I deny direct colon message")
+		return
+	}
+
+	parts := strings.Fields(message[len(":"):])
+	which := parts[0]
+	args := parts[1:]
+
+	colargs := ColonArgs{
+		channel: channel,
+		which:   which,
+		args:    args,
+		grant:   COLON_AUTH_ZERO,
+		Msg:     msg,
+	}
+
+	bot.ExecColon(colargs)
+}
+
+func (*Bot) IsColonMsg(message string) bool {
+	return strings.HasPrefix(message, ":")
+}
+
+func (bot *Bot) ExecColon(colargs ColonArgs) {
+	switch colargs.which {
+	case "hello":
+		bot.PrivMsg(
+			colargs.channel,
+			"지옥은 그리 멀지 않은 곳에 있습니다. 전라남도 신안군에 오십시오.",
+		)
+	case "news":
+		if len(colargs.args) > 0 {
+			whether := colargs.args[0]
+			if whether == "on" {
+				atomic.StoreUint32(&bot.onnews, 0)
+				bot.PrivMsg(colargs.channel, "자동 뉴스 알림 기능이 켜졌습니다.")
+			}
+			if whether == "off" {
+				atomic.StoreUint32(&bot.onnews, 1)
+				bot.PrivMsg(colargs.channel, "자동 뉴스 알림 기능이 꺼졌습니다.")
 			}
 		}
 	}
 }
 
-func (bot *Bot) OnColon(msg Msg) {
-	channel, text := msg.args[0], msg.args[1]
-	command, argline := Chop(
-		text[len(":"):],
-		" ",
-	)
-	args := strings.Fields(argline)
-
-	switch command {
-	case "logbot":
-		bot.Voice(
-			channel,
-			"다음 명령어가 사용 가능합니다: :ln, :log, :ver, :전역, :쿠키런크리스탈수",
-		)
-
-	case "ln":
-		bot.OnLn(channel, args)
-
-	case "log":
-		bot.OnLog(channel, args)
-
-	case "ver":
-		bot.Voice(channel, "logbot 0.1")
-
-	case "쿠키런크리스탈수":
-		bot.Voice(channel, "를 전화해서 물어보세요.")
-		// bot.Voice(channel, "the number of crystals you have in 쿠키런 is a neighborhood of fifteen hundred.")
-
-	case "전역":
-		bot.OnEsc(channel, args)
-
-		// case "*":
-		// 	if channel == bot.nick {
-		// 		bot.OnSig(channel, args, msg)
-		// 	}
-	}
-}
-
-func (bot *Bot) OnLn(channel string, args []string) {
-	if len(args) != 1 {
-		bot.Voice(channel, fmt.Sprintf(
-			":ln expected 1 argument, but given %d arguments", len(args)))
-		return
-	}
-
-	x, err := strconv.ParseFloat(args[0], 64)
-	if err != nil {
-		return
-	}
-
-	bot.Voice(channel, strconv.FormatFloat(
-		math.Log(x), 'f', 32, 64))
-}
-
-func (bot *Bot) OnLog(channel string, args []string) {
-	if len(args) != 2 {
-		bot.Voice(channel, fmt.Sprintf(
-			":log expected 2 arguments, but given %d arguments", len(args)))
-		return
-	}
-
-	x, err := strconv.ParseFloat(args[0], 64)
-	if err != nil {
-		return
-	}
-
-	y, err := strconv.ParseFloat(args[1], 64)
-	if err != nil {
-		return
-	}
-
-	bot.Voice(channel, strconv.FormatFloat(
-		math.Log(x)/math.Log(y), 'f', 32, 64))
-}
-
-func (bot *Bot) OnEsc(channel string, args []string) {
-	bot.Voice(channel, "http://catalase.github.io/ 가서 확인하세요.")
-}
-
-func (bot *Bot) OnSig(channel string, args []string, msg Msg) {
-	if len(args) > 0 {
-		bot.Msg(args[0], args[1:]...)
-	}
-}
-
+// Mkdir makes a directory specified by path with mode.
+// Unlike os.Mkdir, if the directory already exists, a error dose not return.
 func Mkdir(path string, mode os.FileMode) error {
 	err := os.Mkdir(path, mode)
 	if os.IsExist(err) {
@@ -350,63 +362,45 @@ func Mkdir(path string, mode os.FileMode) error {
 }
 
 func main() {
-	if err := Mkdir(logsdir, os.ModePerm); err != nil {
-		fmt.Println("cannot mkdir logs with permission 0777:", err)
-		return
+	if err := Mkdir(logDir, os.ModePerm); err != nil {
+		fmt.Fprintln(os.Stderr, "cannot make log directory:", err)
+		os.Exit(1)
 	}
 
-	if err := os.Chdir(logsdir); err != nil {
-		fmt.Println("cannot change root directory to", logsdir)
-		return
-	}
+	// server address to connect to
+	var address = "irc.ozinger.org:8080"
 
-	defer func() {
-		for _, o := range loggerMap {
-			o.Close()
-		}
-	}()
-
-	var address = "kanade.irc.ozinger.org:8080"
+	// nick to use
 	var nick = "비스무트"
-	var user = "ununseptium"
-	var realname = "하슘"
-	var channels = []string{
-		"#catalase",
-		"#catalase-nut",
-		"#green-net",
-		"#green-pie",
-	}
 
-	for _, channel := range append(
-		channels,
-		"mid",
-		nick,
-	) {
-		path := channel + ".txt"
-		if err := loggerMap.Set(channel, path); err != nil {
-			fmt.Println("cannot open logger for channel", channel,
-				"into which conversation or exchange in the channel are written:", err)
-			return
-		}
+	// user
+	var user = "ununseptium"
+
+	// realname
+	var realname = "하슘"
+
+	// channels to join at the time that the connection establish.
+	var channels = map[string]bool{
+		"#veritas": true,
+		// "#catalase",
+		// "#catalase-nut",
+		// "#green-net",
+		// "#green-pie",
 	}
 
 	bot := Bot{
-		nick:     nick,
-		user:     user,
-		realname: realname,
-		channels: channels,
+		nick:        nick,
+		user:        user,
+		realname:    realname,
+		channels:    channels,
+		closestream: make(chan bool),
 	}
 
-	for {
-		var err error
-		bot.Stream, err = NewStream("kanade.irc.ozinger.org:8080")
-		if err != nil {
-			log.Println(address, "cannot be connected to:", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		log.Println(bot.Run())
-		time.Sleep(time.Second)
+	var err error
+	if bot.Stream, err = Dial(address); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
+
+	bot.Run()
 }
